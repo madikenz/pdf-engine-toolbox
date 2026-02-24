@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker --version:*)",
+      "Bash(docker compose:*)",
+      "Bash(curl:*)",
+      "Bash(python -m json.tool:*)",
+      "Bash(pip index:*)",
+      "Bash(pip install:*)",
+      "Bash(for pkg in fastapi uvicorn PyMuPDF pydantic pydantic-settings httpx python-dotenv structlog openpyxl opencv-python-headless Pillow pillow-heif paddlepaddle paddleocr paddlex pytest pytest-asyncio)",
+      "Bash(do echo -n \"$pkg: \")",
+      "Bash(python:*)",
+      "Bash(done)"
+    ]
+  }
+}

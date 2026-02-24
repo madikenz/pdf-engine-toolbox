@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  pdf-engine:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PDF_ENGINE_SECRET=local-dev-secret-change-me
+      - LOG_LEVEL=debug
+      - MAX_UPLOAD_SIZE_MB=100
+      - WORKERS=2
+      - REQUEST_TIMEOUT_SECONDS=120
+      - PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+    volumes:
+      - ./app:/app/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

@@ -1,0 +1,246 @@
+"""Text extraction, search, bookmark, table, and OCR endpoints."""
+
+import base64
+import time
+
+from fastapi import APIRouter, BackgroundTasks, Depends, Response
+
+from app.dependencies import require_auth
+from app.models.requests import (
+    TextExtractRequest,
+    TextSearchRequest,
+    BookmarksRequest,
+    ExtractTablesRequest,
+    OcrRequest,
+)
+from app.models.responses import (
+    TextExtractResponse,
+    TextExtractData,
+    PageText,
+    TextBlock,
+    TextSearchResponse,
+    TextSearchData,
+    SearchMatch,
+    ExtractTablesResponse,
+    ExtractTablesData,
+    ExtractedTable,
+    OcrResponse,
+    OcrData,
+    OcrPageResult,
+    OcrWord,
+    TaskAcceptedResponse,
+)
+from app.services import download_service, pdf_service, task_service, cache_service
+
+router = APIRouter(prefix="/text")
+
+
+@router.post(
+    "/extract", response_model=TextExtractResponse, dependencies=[Depends(require_auth)]
+)
+async def extract_text(request: TextExtractRequest):
+    """Extract text from PDF pages with optional position data."""
+    start = time.monotonic()
+
+    pdf_bytes = await download_service.download_pdf(request.source_url)
+    pages_data = pdf_service.extract_text(
+        pdf_bytes, request.pages, request.include_positions
+    )
+
+    elapsed = (time.monotonic() - start) * 1000
+
+    pages = []
+    for pd in pages_data:
+        blocks = None
+        if pd.get("blocks"):
+            blocks = [TextBlock(**b) for b in pd["blocks"]]
+        pages.append(
+            PageText(
+                page_index=pd["page_index"],
+                text=pd["text"],
+                blocks=blocks,
+            )
+        )
+
+    return TextExtractResponse(
+        success=True,
+        data=TextExtractData(pages=pages),
+        processing_time_ms=round(elapsed, 2),
+    )
+
+
+@router.post(
+    "/search", response_model=TextSearchResponse, dependencies=[Depends(require_auth)]
+)
+async def search_text(request: TextSearchRequest):
+    """Search for text across all PDF pages."""
+    start = time.monotonic()
+
+    pdf_bytes = await download_service.download_pdf(request.source_url)
+    result = pdf_service.search_text(pdf_bytes, request.query, request.case_sensitive)
+
+    elapsed = (time.monotonic() - start) * 1000
+
+    return TextSearchResponse(
+        success=True,
+        data=TextSearchData(
+            total_matches=result["total_matches"],
+            matches=[SearchMatch(**m) for m in result["matches"]],
+        ),
+        processing_time_ms=round(elapsed, 2),
+    )
+
+
+@router.post("/bookmarks", dependencies=[Depends(require_auth)])
+async def add_bookmarks(request: BookmarksRequest):
+    """Add bookmarks (table of contents) to a PDF."""
+    pdf_bytes = await download_service.download_pdf(request.source_url)
+    bookmarks = [b.model_dump() for b in request.bookmarks]
+    result = pdf_service.add_bookmarks(pdf_bytes, bookmarks)
+    return Response(content=result, media_type="application/pdf")
+
+
+@router.post(
+    "/tables", response_model=ExtractTablesResponse, dependencies=[Depends(require_auth)]
+)
+async def extract_tables(request: ExtractTablesRequest):
+    """Extract tabular data from PDF pages.
+
+    Supports three strategies:
+    - ``auto`` (default): PyMuPDF for digital pages, PP-Structure for scans.
+    - ``pymupdf``: Fast rule-based extraction (digital PDFs only).
+    - ``ppstructure``: Neural network table recognition (best for scanned
+      1099s, W-2s, K-1s with faint or crooked lines).
+    """
+    start = time.monotonic()
+
+    pdf_bytes = await download_service.download_pdf(request.source_url)
+    tables = pdf_service.extract_tables(
+        pdf_bytes,
+        request.pages,
+        strategy=request.strategy,
+        language=request.language,
+        dpi=request.dpi,
+    )
+
+    elapsed = (time.monotonic() - start) * 1000
+
+    return ExtractTablesResponse(
+        success=True,
+        data=ExtractTablesData(
+            tables=[ExtractedTable(**t) for t in tables],
+            total_count=len(tables),
+        ),
+        processing_time_ms=round(elapsed, 2),
+    )
+
+
+def _build_ocr_response(result: dict, elapsed_ms: float) -> OcrResponse:
+    """Convert the raw ocr_pages() dict into the Pydantic OcrResponse."""
+    pdf_b64 = base64.b64encode(result["pdf_bytes"]).decode("ascii")
+
+    pages = [
+        OcrPageResult(
+            page_index=p["page_index"],
+            words=[OcrWord(**w) for w in p["words"]],
+            full_text=p["full_text"],
+        )
+        for p in result["pages"]
+    ]
+
+    return OcrResponse(
+        success=True,
+        data=OcrData(
+            pages=pages,
+            total_words=result["total_words"],
+            avg_confidence=result["avg_confidence"],
+            pdf_base64=pdf_b64,
+        ),
+        processing_time_ms=round(elapsed_ms, 2),
+    )
+
+
+async def _run_ocr(task_id: str, pdf_bytes: bytes, pages, language: str, dpi: int):
+    """Background worker for OCR processing."""
+    task_service.set_processing(task_id)
+    try:
+        result = pdf_service.ocr_pages(pdf_bytes, pages, language, dpi)
+        # Store summary metadata (per-word data is too large for in-memory task store)
+        task_service.complete_task(task_id, {
+            "total_words": result["total_words"],
+            "avg_confidence": result["avg_confidence"],
+            "pdf_size_bytes": len(result["pdf_bytes"]),
+            "page_count": len(result["pages"]),
+        })
+    except Exception as e:
+        task_service.fail_task(task_id, str(e))
+
+
+@router.post("/ocr", dependencies=[Depends(require_auth)])
+async def ocr_pages(request: OcrRequest, background_tasks: BackgroundTasks):
+    """Run PaddleOCR on scanned PDF pages.
+
+    Returns rich JSON with per-word text, 4-point bounding boxes (in PDF
+    points), and confidence scores.  Also includes the PDF with an invisible
+    text layer (base64-encoded) so Ctrl+F search works in viewers.
+
+    Uses ``use_angle_cls=True`` to handle rotated receipts/scans.
+
+    For small documents (≤5 pages), processes synchronously.
+    For larger documents, runs as a background task — returns a ``task_id``
+    for polling via ``GET /tasks/{task_id}``.
+    """
+    pdf_bytes = await download_service.download_pdf(request.source_url)
+
+    # Check cache (OCR is expensive)
+    src_hash = cache_service.content_hash(pdf_bytes)
+    cache_params = {
+        "pages": sorted(request.pages) if request.pages else None,
+        "language": request.language,
+        "dpi": request.dpi,
+    }
+    cached = cache_service.get_cached(src_hash, "ocr", cache_params)
+    if cached and isinstance(cached, dict):
+        return OcrResponse(
+            success=True,
+            data=OcrData(**cached),
+            processing_time_ms=0.0,
+        )
+
+    # Determine page count
+    page_count = len(request.pages) if request.pages else 0
+    if page_count == 0:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page_count = len(doc)
+
+    # Small docs → synchronous
+    if page_count <= 5:
+        start = time.monotonic()
+        result = pdf_service.ocr_pages(pdf_bytes, request.pages, request.language, request.dpi)
+        elapsed = (time.monotonic() - start) * 1000
+
+        # Cache the serialisable portion (without raw pdf_bytes)
+        pdf_b64 = base64.b64encode(result["pdf_bytes"]).decode("ascii")
+        cache_data = {
+            "pages": result["pages"],
+            "total_words": result["total_words"],
+            "avg_confidence": result["avg_confidence"],
+            "pdf_base64": pdf_b64,
+        }
+        cache_service.put_cached(src_hash, "ocr", cache_data, cache_params, ttl=7200)
+
+        return _build_ocr_response(result, elapsed)
+
+    # Large docs → background task
+    task = task_service.create_task("ocr")
+    background_tasks.add_task(
+        _run_ocr, task.id, pdf_bytes, request.pages, request.language, request.dpi,
+    )
+
+    return TaskAcceptedResponse(
+        success=True,
+        task_id=task.id,
+        status="pending",
+        message=f"OCR started for {page_count} pages. Poll GET /tasks/{task.id} for status.",
+    )
