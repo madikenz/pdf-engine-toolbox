@@ -29,18 +29,10 @@ RUN pip install --no-cache-dir setuptools && \
 
 # Pre-download PaddleOCR PP-OCRv5 models + PPStructureV3 table models
 # during build (avoids ~300 MB download at runtime).
-# Allow failure: if model pre-download fails (e.g. segfault in CI),
-# models will download on first request instead.
-RUN python -c "\
-from paddleocr import PaddleOCR, PPStructureV3; \
-PaddleOCR(ocr_version='PP-OCRv5', lang='en', device='cpu', \
-    use_doc_orientation_classify=False, use_doc_unwarping=False, \
-    use_textline_orientation=True); \
-PPStructureV3(device='cpu', lang='en', \
-    use_doc_orientation_classify=False, use_doc_unwarping=False, \
-    use_textline_orientation=False, use_seal_recognition=False, \
-    use_formula_recognition=False, use_chart_recognition=False, \
-    use_table_recognition=True)" || echo "Model pre-download failed; models will download at runtime"
+# Script is used instead of inline python -c to avoid Coolify ARG injection bug
+# with multi-line backslash-continued RUN commands.
+COPY scripts/download_models.py /tmp/download_models.py
+RUN python /tmp/download_models.py || echo "Model pre-download failed; models will download at runtime"
 
 # Copy application code
 COPY app/ ./app/
