@@ -7,6 +7,7 @@ thumbnails, and final PDF assembly.
 Licensed under AGPL-3.0 (required by PyMuPDF dependency).
 """
 
+import asyncio
 import time
 from contextlib import asynccontextmanager
 
@@ -40,6 +41,22 @@ log = structlog.get_logger()
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown."""
     log.info("pdf_engine_starting", log_level=settings.log_level)
+
+    # Pre-warm PaddleOCR models so the first OCR request doesn't cold-start
+    # (~2-5 min on CPU). Run in a thread executor to avoid blocking the event
+    # loop (and failing health checks) during model loading.
+    try:
+        def _warmup():
+            from app.services.pdf_service import _get_paddle_ocr, _get_pp_structure
+            _get_paddle_ocr("en")
+            _get_pp_structure("en")
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _warmup)
+        log.info("pdf_engine_models_ready")
+    except Exception as exc:
+        log.warning("pdf_engine_warmup_failed", error=str(exc))
+
     yield
     log.info("pdf_engine_shutting_down")
 
