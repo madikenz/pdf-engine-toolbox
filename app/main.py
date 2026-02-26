@@ -42,14 +42,15 @@ async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown."""
     log.info("pdf_engine_starting", log_level=settings.log_level)
 
-    # Pre-warm PaddleOCR models so the first OCR request doesn't cold-start
-    # (~2-5 min on CPU). Run in a thread executor to avoid blocking the event
-    # loop (and failing health checks) during model loading.
+    # Pre-warm PaddleOCR models so the first OCR request doesn't cold-start.
+    # Only warm up the core OCR pipeline (_get_paddle_ocr) — NOT PPStructureV3
+    # (_get_pp_structure), which loads PP-Chart2Table (~1.5 GB transformer) and
+    # would OOM a t3a.medium (4 GB RAM) when combined with the rest of the stack.
+    # PPStructure models load lazily on first classify/table request.
     try:
         def _warmup():
-            from app.services.pdf_service import _get_paddle_ocr, _get_pp_structure
+            from app.services.pdf_service import _get_paddle_ocr
             _get_paddle_ocr("en")
-            _get_pp_structure("en")
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _warmup)
