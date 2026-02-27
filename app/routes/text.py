@@ -160,18 +160,38 @@ def _build_ocr_response(result: dict, elapsed_ms: float) -> OcrResponse:
     )
 
 
-async def _run_ocr(task_id: str, pdf_bytes: bytes, pages, language: str, dpi: int):
-    """Background worker for OCR processing."""
+def _run_ocr(task_id: str, pdf_bytes: bytes, pages, language: str, dpi: int):
+    """Background worker for OCR processing.
+
+    IMPORTANT: Must be a regular ``def`` (not ``async def``) so Starlette
+    runs it via ``run_in_threadpool()`` instead of ``await``-ing it on the
+    event loop.  PaddleOCR inference is CPU-bound and blocks for minutes;
+    an ``async def`` wrapper would freeze the event loop and prevent
+    ``complete_task()`` from executing.
+    """
     task_service.set_processing(task_id)
     try:
         result = pdf_service.ocr_pages(pdf_bytes, pages, language, dpi)
-        # Store summary metadata (per-word data is too large for in-memory task store)
-        task_service.complete_task(task_id, {
+        pdf_b64 = base64.b64encode(result["pdf_bytes"]).decode("ascii")
+
+        # Build the full result the client expects (pages + pdf_base64)
+        ocr_data = {
+            "pages": result["pages"],
             "total_words": result["total_words"],
             "avg_confidence": result["avg_confidence"],
-            "pdf_size_bytes": len(result["pdf_bytes"]),
-            "page_count": len(result["pages"]),
-        })
+            "pdf_base64": pdf_b64,
+        }
+
+        # Cache for future identical requests
+        src_hash = cache_service.content_hash(pdf_bytes)
+        cache_params = {
+            "pages": sorted(pages) if pages else None,
+            "language": language,
+            "dpi": dpi,
+        }
+        cache_service.put_cached(src_hash, "ocr", ocr_data, cache_params)
+
+        task_service.complete_task(task_id, ocr_data)
     except Exception as e:
         task_service.fail_task(task_id, str(e))
 
