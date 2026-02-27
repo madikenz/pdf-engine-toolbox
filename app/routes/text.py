@@ -214,25 +214,10 @@ async def ocr_pages(request: OcrRequest, background_tasks: BackgroundTasks):
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         page_count = len(doc)
 
-    # Small docs → synchronous
-    if page_count <= 5:
-        start = time.monotonic()
-        result = pdf_service.ocr_pages(pdf_bytes, request.pages, request.language, request.dpi)
-        elapsed = (time.monotonic() - start) * 1000
-
-        # Cache the serialisable portion (without raw pdf_bytes)
-        pdf_b64 = base64.b64encode(result["pdf_bytes"]).decode("ascii")
-        cache_data = {
-            "pages": result["pages"],
-            "total_words": result["total_words"],
-            "avg_confidence": result["avg_confidence"],
-            "pdf_base64": pdf_b64,
-        }
-        cache_service.put_cached(src_hash, "ocr", cache_data, cache_params, ttl=7200)
-
-        return _build_ocr_response(result, elapsed)
-
-    # Large docs → background task
+    # Always use background tasks for OCR — CPU inference with PP-OCRv5
+    # server_det at 300 DPI can exceed HTTP client timeouts (120s) even for
+    # single-page documents on constrained instances (t3a.medium / 2 vCPU).
+    # The client polls via GET /tasks/{task_id} with OCR_TIMEOUT_MS.
     task = task_service.create_task("ocr")
     background_tasks.add_task(
         _run_ocr, task.id, pdf_bytes, request.pages, request.language, request.dpi,
